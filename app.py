@@ -126,22 +126,24 @@ def attach_coords(df: pd.DataFrame, name_col="역명") -> pd.DataFrame:
     return df
 
 
+def senior_by_station_sql() -> str:
+    return (f"SELECT 역명, 역번호, SUM({H_ALL}) AS 노인_연간이용\n"
+            f"FROM 노인이용\nGROUP BY 역번호\nORDER BY 노인_연간이용 DESC")
+
 @st.cache_data(show_spinner=False)
 def senior_by_station() -> pd.DataFrame:
     """역별 연간 노인 이용(승차+하차 전체)."""
-    return run_query(
-        f"SELECT 역명, 역번호, SUM({H_ALL}) AS 노인_연간이용 "
-        f"FROM 노인이용 GROUP BY 역번호 ORDER BY 노인_연간이용 DESC"
-    )
+    return run_query(senior_by_station_sql())
 
+
+def board_alight_by_band_sql() -> str:
+    cols = ",\n       ".join(f'SUM({_sum_expr(hs)}) AS "{b}"' for b, hs in BANDS.items())
+    return f"SELECT 역번호, 역명, 승하차,\n       {cols}\nFROM 노인이용\nGROUP BY 역번호, 승하차"
 
 @st.cache_data(show_spinner=False)
 def board_alight_by_band() -> pd.DataFrame:
     """역별·승하차별 시간대 합계 (지도용)."""
-    cols = ", ".join(f"SUM({_sum_expr(hs)}) AS \"{b}\"" for b, hs in BANDS.items())
-    return run_query(
-        f"SELECT 역번호, 역명, 승하차, {cols} FROM 노인이용 GROUP BY 역번호, 승하차"
-    )
+    return run_query(board_alight_by_band_sql())
 
 
 @st.cache_data(show_spinner=False)
@@ -158,10 +160,13 @@ def facility_summary() -> dict:
     return out
 
 
+def facilities_sql() -> str:
+    return "SELECT 역번호, 역명, 역주변 FROM 역세권"
+
 @st.cache_data(show_spinner=False)
 def facilities() -> pd.DataFrame:
-    """역별 주변시설 원자료 + 분류."""
-    df = run_query("SELECT 역번호, 역명, 역주변 FROM 역세권")
+    """역별 주변시설 원자료 + 분류(분류는 파이썬에서 키워드로 처리)."""
+    df = run_query(facilities_sql())
     def cat(x):
         x = x or ""
         if any(k in x for k in ("병원", "의원", "보건")):       return "의료"
@@ -175,15 +180,16 @@ def facilities() -> pd.DataFrame:
     return df
 
 
+def boardings_line_band_sql() -> str:
+    cols = ",\n       ".join(f'SUM({_sum_expr(hs)}) AS "{b}"' for b, hs in BANDS.items())
+    # GROUP BY는 반드시 '노선'(교정 별칭)으로! '호선'은 원본 버그 컬럼이 잡힘
+    return (f"SELECT ({LINE_CASE}) AS 노선,\n       {cols}\n"
+            f"FROM 노인이용\nWHERE 승하차='승차'\nGROUP BY 노선\nORDER BY 노선")
+
 @st.cache_data(show_spinner=False)
 def boardings_line_band() -> pd.DataFrame:
     """[시뮬레이터 핵심] 호선 × 시간대 노인 '승차'(무임 건수) 합계."""
-    cols = ", ".join(f"SUM({_sum_expr(hs)}) AS \"{b}\"" for b, hs in BANDS.items())
-    # GROUP BY는 반드시 '노선'(교정 별칭)으로! '호선'은 원본 버그 컬럼이 잡힘
-    return run_query(
-        f"SELECT ({LINE_CASE}) AS 노선, {cols} "
-        f"FROM 노인이용 WHERE 승하차='승차' GROUP BY 노선 ORDER BY 노선"
-    )
+    return run_query(boardings_line_band_sql())
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -218,6 +224,48 @@ def generate_advice(api_key: str, context: str) -> str:
 # ──────────────────────────────────────────────────────────────────────────
 # 3. 화면
 # ──────────────────────────────────────────────────────────────────────────
+# 탭별 핵심 인사이트 (분석 과정에서 함께 도출한 내용)
+INSIGHTS = {
+    "map": (
+        "노인 이용은 도시 전체에 고르게 퍼져 있지 않고 **일부 거점역에 뚜렷하게 집중**됩니다. "
+        "청량리·제기동·종로3가·연신내·사당 등 도심·환승·생활거점 역이 상위를 차지해요. "
+        "따라서 정책 개입도 모든 역을 똑같이 다루기보다 **이 거점들을 중심으로 설계**하는 것이 효율적입니다."
+    ),
+    "time_fac": (
+        "노인 승차는 출근(7-9시)보다 **낮·퇴근 시간대에 더 많습니다** — 노인은 통근이 아니라 생활 목적으로 이동해요. "
+        "아침에는 서울역·선릉·압구정처럼 업무·상업 중심지에 **하차가 몰리고**, 다이용 역 주변에는 "
+        "**전통시장·복지시설·병원** 같은 생활밀착형 시설이 많습니다. 즉 노인 이동의 핵심 동인은 '출퇴근'이 아니라 "
+        "'병원·시장·복지'이며, 이런 역은 혼잡 관리보다 **접근성 보장**의 관점이 필요합니다. "
+        "(단, 이 데이터는 역별 승·하차 **총량**이라 'A→B' 개별 이동(OD)은 알 수 없습니다.)"
+    ),
+    "sim": (
+        "이 데이터 기준 연간 노인 승차는 약 **2.38억 건**, 기본요금 1,550원을 적용하면 명목 무임손실은 "
+        "약 **3,686억원**입니다. 출퇴근 피크에만 정상요금의 절반을 부과해도 회복액은 **약 14%(≈500억원대)** 에 그쳐요. "
+        "다만 이 수치는 *행동 변화를 가정하지 않은 명목상 최대치*입니다 — 요금이 생기면 이용을 줄이는 노인이 많아 "
+        "실제로는 그만큼 걷히지 않고, 운행 중 열차의 한계비용은 0에 가까우며, 무임승차는 손실인 동시에 "
+        "**노인 이동권·복지** 정책이기도 합니다. 따라서 *'이 조건에서 줄어드는 무임액의 상한선'* 으로만 해석해야 합니다."
+    ),
+    "ai": (
+        "①~③의 실제 수치를 종합해 정책 제언을 생성합니다. 핵심 진단은 일관됩니다 — "
+        "노인 수요는 **거점·생활시설 중심**이고 **혼잡 피크와 시간대가 어긋나며**, "
+        "요금 부과의 명목 회복 효과는 **제한적**이라는 점을 균형 있게 고려해야 한다는 것입니다."
+    ),
+}
+
+
+def render_insight(key: str):
+    st.info("💡 **핵심 인사이트** — " + INSIGHTS[key])
+
+
+def render_sql(sqls):
+    """sqls: [(label, sql), ...] — 탭에서 사용한 SQL을 펼침 영역에 표시."""
+    with st.expander("🔍 이 탭에서 사용한 SQL 보기"):
+        for label, sql in sqls:
+            if label:
+                st.markdown(f"**{label}**")
+            st.code(sql, language="sql")
+
+
 def main():
     if not os.path.exists(DB_PATH):
         st.error(f"DB 파일 `{DB_PATH}` 을(를) 찾을 수 없습니다. app.py와 같은 위치에 두세요.")
@@ -249,6 +297,7 @@ def main():
     # ── ① 노선·역 지도 + 노인 아이콘 ─────────────────────────────────────
     with tabs[0]:
         st.subheader("① 서울 지하철 노선도 위에 노인 다이용 역 표시")
+        render_insight("map")
         ss = attach_coords(senior_by_station())
         ss["노선"] = ss["역번호"].map(line_name)
         n = st.slider("노인 아이콘으로 강조할 상위 역 수", 5, 40, 20, key="t1n")
@@ -322,10 +371,16 @@ def main():
         st.caption("※ 노선은 역을 번호 순으로 연결한 **개략도**입니다(지선·일부 미좌표 구간은 끊겨 보일 수 있음).")
         st.dataframe(top[["역명", "노선", "노인_연간이용"]], hide_index=True, use_container_width=True,
                      column_config={"노인_연간이용": st.column_config.NumberColumn(format="%d")})
+        render_sql([
+            ("역별 연간 노인 이용 (지도 마커 크기에 사용)", senior_by_station_sql()),
+            ("역 좌표 (역명 정규화 후 파이썬에서 join, 일부 주요역은 좌표 보완)",
+             "SELECT 역명, 위도, 경도 FROM 역좌표 WHERE 역명 IS NOT NULL"),
+        ])
 
     # ── ② 시간대별 승하차 + 주변시설 (지도 팝업) ─────────────────────────
     with tabs[1]:
         st.subheader("② 시간대별로 어디서 타고 내리나 + 역 주변시설")
+        render_insight("time_fac")
         ba = board_alight_by_band()
         facsum = facility_summary()
         cc1, cc2 = st.columns(2)
@@ -380,10 +435,15 @@ def main():
             "이 데이터는 역별 **승차/하차 총량**입니다. 'A역→B역'처럼 개별 이동을 연결한 "
             "기종점(OD) 자료가 아니므로, 출발·도착의 **공간 패턴**으로 해석해 주세요."
         )
+        render_sql([
+            ("시간대별 승·하차(역별) — 지도 마커", board_alight_by_band_sql()),
+            ("주변시설 원자료 (의료·전통시장·복지 등 분류는 파이썬 키워드로 처리)", facilities_sql()),
+        ])
 
     # ── ③ 적자 회복 시뮬레이터 (시간대별 요금 + 전후 비교) ────────────────
     with tabs[2]:
         st.subheader("③ 시간대별 요금을 다르게 매기면 무임손실이 얼마나 회복될까")
+        render_insight("sim")
         bl = boardings_line_band()
         band_cols = list(BANDS.keys())
 
@@ -443,10 +503,12 @@ def main():
         with st.expander("시뮬레이션 상세표 / 호선×시간대 원자료"):
             st.dataframe(sim.round(1), hide_index=True, use_container_width=True)
             st.dataframe(bl, hide_index=True, use_container_width=True)
+        render_sql([("호선 × 시간대 노인 승차(무임 건수) — 시뮬레이터 입력", boardings_line_band_sql())])
 
     # ── 🤖 AI 자문 ───────────────────────────────────────────────────────
     with tabs[3]:
         st.subheader("🤖 AI 정책 자문 (Gemini)")
+        render_insight("ai")
         key = get_api_key()
 
         def build_ctx():
@@ -475,6 +537,10 @@ def main():
                 st.markdown("---"); st.markdown(st.session_state["advice"])
         with st.expander("AI 입력 요약 보기"):
             st.code(build_ctx(), language="text")
+        render_sql([
+            ("노인 이용 상위 역 (자문 컨텍스트)", senior_by_station_sql()),
+            ("호선별 노인 승차 합계 (자문 컨텍스트)", boardings_line_band_sql()),
+        ])
 
 
 if __name__ == "__main__":
