@@ -33,6 +33,20 @@ SEOUL_CENTER = [37.5563, 126.9905]
 
 st.set_page_config(page_title="노인 무임승차 정책 어드바이저", page_icon="🚇", layout="wide")
 
+# 호선별 대표색 + 역번호→호선 변환(파이썬용)
+LINE_COLORS = {
+    "1호선": "#0052A4", "2호선": "#00A84D", "3호선": "#EF7C1C", "4호선": "#00A5DE",
+    "5호선": "#996CAC", "6호선": "#CD7C2F", "7호선": "#747F00", "8호선": "#E6186C",
+}
+LINE_RANGES = [(100, 199, "1호선"), (200, 299, "2호선"), (300, 399, "3호선"),
+               (400, 499, "4호선"), (2500, 2599, "5호선"), (2600, 2699, "6호선"),
+               (2700, 2799, "7호선"), (2800, 2899, "8호선")]
+def line_name(no):
+    for lo, hi, nm in LINE_RANGES:
+        if lo <= no <= hi:
+            return nm
+    return "기타"
+
 # 시간대(시) 정의 — 하루 전체를 4구간으로 분할(합치면 전체)
 BANDS = {
     "출근피크(7-9시)":  [7, 8, 9],
@@ -232,36 +246,81 @@ def main():
         "③ 적자 회복 시뮬레이터", "🤖 AI 자문",
     ])
 
-    # ── ① 노인 다이용 역 지도 (노인 아이콘) ──────────────────────────────
+    # ── ① 노선·역 지도 + 노인 아이콘 ─────────────────────────────────────
     with tabs[0]:
-        st.subheader("① 노인이 많이 이용하는 역 — 지도 위 노인 아이콘")
+        st.subheader("① 서울 지하철 노선도 위에 노인 다이용 역 표시")
         ss = attach_coords(senior_by_station())
-        n = st.slider("표시할 상위 역 수", 5, 40, 20, key="t1n")
-        top = ss.head(n)
-        mapped = top.dropna(subset=["lat", "lon"])
+        ss["노선"] = ss["역번호"].map(line_name)
+        n = st.slider("노인 아이콘으로 강조할 상위 역 수", 5, 40, 20, key="t1n")
 
         m = folium.Map(location=SEOUL_CENTER, zoom_start=11, tiles="CartoDB positron")
+
+        # (1) 노선: 역번호 순으로 연결, 5km 초과 구간은 끊어 그림(지선·루프 오연결 방지)
+        fg_line = folium.FeatureGroup(name="지하철 노선", show=True)
+        for ln, color in LINE_COLORS.items():
+            d = ss[ss["노선"] == ln].dropna(subset=["lat", "lon"]).sort_values("역번호")
+            pts, seg = list(zip(d["lat"], d["lon"])) if len(d) else [], []
+            for p in pts:
+                if seg:
+                    a = seg[-1]
+                    gap = ((a[0] - p[0])**2 + ((a[1] - p[1]) * 0.8)**2) ** 0.5 * 111
+                    if gap > 5:
+                        if len(seg) >= 2:
+                            folium.PolyLine(seg, color=color, weight=4, opacity=0.7).add_to(fg_line)
+                        seg = []
+                seg.append(p)
+            if len(seg) >= 2:
+                folium.PolyLine(seg, color=color, weight=4, opacity=0.7).add_to(fg_line)
+        fg_line.add_to(m)
+
+        # (2) 역 아이콘: 좌표 있는 모든 역을 작은 점(호선색)으로
+        fg_st = folium.FeatureGroup(name="역", show=True)
+        for _, r in ss.dropna(subset=["lat", "lon"]).iterrows():
+            folium.CircleMarker(
+                [r["lat"], r["lon"]], radius=3, color="#555", weight=1, fill=True,
+                fill_color=LINE_COLORS.get(r["노선"], "#888"), fill_opacity=0.9,
+                tooltip=f"{r['역명']} ({r['노선']})",
+            ).add_to(fg_st)
+        fg_st.add_to(m)
+
+        # (3) 노인 아이콘: 상위 N개 역 — 역 아이콘 '위'에 올림(마커 레이어가 항상 최상단)
+        top = ss.head(n)
+        mapped = top.dropna(subset=["lat", "lon"])
         vmax = mapped["노인_연간이용"].max() if not mapped.empty else 1
+        fg_old = folium.FeatureGroup(name="노인 다이용 역(👴)", show=True)
         for _, r in mapped.iterrows():
             v = int(r["노인_연간이용"])
-            size = int(18 + 26 * (v / vmax))                  # 18~44px
+            size = int(20 + 26 * (v / vmax))           # 20~46px
             folium.Marker(
                 [r["lat"], r["lon"]],
                 tooltip=f"{r['역명']}: {v:,}",
-                popup=folium.Popup(f"<b>{r['역명']}</b><br>연간 노인이용 {v:,}", max_width=200),
+                popup=folium.Popup(f"<b>{r['역명']}</b> ({r['노선']})<br>연간 노인이용 {v:,}", max_width=220),
                 icon=folium.DivIcon(
-                    html=f'<div style="font-size:{size}px; line-height:1; text-align:center;">👴</div>',
+                    html=f'<div style="font-size:{size}px;line-height:1;text-align:center;'
+                         f'text-shadow:0 0 3px #fff,0 0 3px #fff,0 0 3px #fff;">👴</div>',
                     icon_size=(size, size), icon_anchor=(size // 2, size // 2),
                 ),
-            ).add_to(m)
-        st_folium(m, height=520, returned_objects=[], key="map1")
+            ).add_to(fg_old)
+        fg_old.add_to(m)
 
+        # 색상 범례(지도 내 고정)
+        legend = ('<div style="position:fixed;bottom:18px;left:18px;z-index:1000;background:#fff;'
+                  'padding:6px 8px;border-radius:6px;font-size:12px;box-shadow:0 1px 4px rgba(0,0,0,.3);'
+                  'max-width:160px;line-height:1.7;">'
+                  + "".join(f'<span style="display:inline-block;width:11px;height:11px;background:{c};'
+                            f'border-radius:2px;margin:0 4px 0 6px;"></span>{ln}' for ln, c in LINE_COLORS.items())
+                  + '</div>')
+        m.get_root().html.add_child(folium.Element(legend))
+        folium.LayerControl(collapsed=False).add_to(m)
+
+        st_folium(m, height=560, returned_objects=[], key="map1")
         c1, c2 = st.columns([3, 1])
-        c1.caption("👴 아이콘이 클수록 노인 이용이 많은 역입니다.")
+        c1.caption("노선(호선색 선) 위에 역(작은 점)과 노인 다이용 역(👴)을 겹쳐 표시했습니다. 우측 상단에서 레이어를 끄고 켤 수 있어요.")
         miss = int(top["lat"].isna().sum())
         if miss:
             c2.caption(f"※ 좌표 없는 역 {miss}곳 제외")
-        st.dataframe(top[["역명", "노인_연간이용"]], hide_index=True, use_container_width=True,
+        st.caption("※ 노선은 역을 번호 순으로 연결한 **개략도**입니다(지선·일부 미좌표 구간은 끊겨 보일 수 있음).")
+        st.dataframe(top[["역명", "노선", "노인_연간이용"]], hide_index=True, use_container_width=True,
                      column_config={"노인_연간이용": st.column_config.NumberColumn(format="%d")})
 
     # ── ② 시간대별 승하차 + 주변시설 (지도 팝업) ─────────────────────────
