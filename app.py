@@ -204,21 +204,28 @@ def get_api_key():
     return os.environ.get("GEMINI_API_KEY") or st.session_state.get("manual_api_key")
 
 
-def generate_advice(api_key: str, context: str) -> str:
+def chat_advice(api_key: str, history: list, context: str) -> str:
+    """멀티턴 대화로 정책 자문을 작성·수정한다.
+    history: [{"role": "user"/"assistant", "content": str}, ...] (마지막이 user 발화).
+    context: 데이터 요약. 매 호출 시 첫 턴에 시스템 안내로 함께 전달해 맥락을 유지한다."""
     from google import genai
     client = genai.Client(api_key=api_key)
-    prompt = f"""당신은 대중교통 정책 데이터 분석가입니다. 아래는 서울 지하철 노인
-무임승차·혼잡·역세권 데이터에서 도출한 실제 수치입니다.
-
-{context}
-
-이 수치에 근거해 '노인 무임승차 제도 개선' 자문 초안을 작성하세요.
-구성: 1)핵심 진단 2)정책 대안(시간대 차등·노선 차등·부분 요금 등 2~3가지의 장단점)
-3)우선 개입 대상 4)유의점(효율성과 복지·형평성 균형).
-특정 입장을 단정하지 말고 의사결정자가 판단하도록 선택지와 근거를 제시하세요.
-무임손실 추정은 '행동변화를 가정하지 않은 명목 최대치'임을 분명히 언급하세요.
-한국어, 마크다운으로."""
-    return client.models.generate_content(model=GEMINI_MODEL, contents=prompt).text
+    system = (
+        "당신은 대중교통 정책 데이터 분석가입니다. 아래 서울 지하철 노인 무임승차·혼잡·역세권 "
+        "실제 수치에 근거해 '노인 무임승차 제도 개선' 자문을 작성하고, 사용자의 후속 요청에 따라 "
+        "이전 답변을 자연스럽게 수정합니다. 특정 입장을 단정하지 말고 선택지와 근거를 제시하세요. "
+        "무임손실 추정은 '행동변화를 가정하지 않은 명목 최대치'(요금 부과 시 이용 감소는 시뮬레이터의 "
+        "가격 민감도 α로 별도 반영)임을 분명히 언급하세요. 한국어 마크다운으로 답하세요.\n\n"
+        f"[참고 데이터]\n{context}"
+    )
+    contents = [
+        {"role": "user", "parts": [{"text": system}]},
+        {"role": "model", "parts": [{"text": "네, 데이터를 확인했습니다. 어떤 자문이 필요하신가요?"}]},
+    ]
+    for m in history:
+        role = "user" if m.get("role") == "user" else "model"
+        contents.append({"role": role, "parts": [{"text": m.get("content", "")}]})
+    return client.models.generate_content(model=GEMINI_MODEL, contents=contents).text
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -240,10 +247,11 @@ INSIGHTS = {
     ),
     "sim": (
         "이 데이터 기준 연간 노인 승차는 약 **2.38억 건**, 기본요금 1,550원을 적용하면 명목 무임손실은 "
-        "약 **3,686억원**입니다. 출퇴근 피크에만 정상요금의 절반을 부과해도 회복액은 **약 14%(≈500억원대)** 에 그쳐요. "
-        "다만 이 수치는 *행동 변화를 가정하지 않은 명목상 최대치*입니다 — 요금이 생기면 이용을 줄이는 노인이 많아 "
-        "실제로는 그만큼 걷히지 않고, 운행 중 열차의 한계비용은 0에 가까우며, 무임승차는 손실인 동시에 "
-        "**노인 이동권·복지** 정책이기도 합니다. 따라서 *'이 조건에서 줄어드는 무임액의 상한선'* 으로만 해석해야 합니다."
+        "약 **3,686억원**입니다. 출퇴근 피크에만 정상요금의 절반을 부과하는 시나리오의 회복률은, 이용이 줄지 "
+        "않는다고 보면 약 14%지만 **이용 감소(가격 민감도)를 반영하면 그보다 낮습니다**(α=0.5 가정 시 약 10%대). "
+        "아래 **가격 민감도 α 슬라이더**로 행동 변화를 조절할 수 있어요 — α=0은 행동변화 없는 명목 최대치입니다. "
+        "요금이 생기면 이용을 줄이는 노인이 많고, 운행 중 열차의 한계비용은 0에 가깝고, 무임승차는 손실인 동시에 "
+        "**노인 이동권·복지** 정책이기도 하다는 점을 함께 봐야 합니다."
     ),
     "ai": (
         "①~③의 실제 수치를 종합해 정책 제언을 생성합니다. 핵심 진단은 일관됩니다 — "
@@ -461,26 +469,46 @@ def main():
             band_fare[b] = cols[i].number_input(
                 b, 0, int(base_fare), min(int(defaults[i]), int(base_fare)), 50, key=f"bf_{i}")
 
+        # 가격 민감도 α — 요금이 생기면 노인 이용이 줄어드는 정도(수요 반응)를 반영.
+        #   α=0 → 이용 그대로(행동변화 없는 명목 최대치, 기존 방식)
+        #   α=1 → 노인요금이 성인요금과 같아지면 노인 이용이 0
+        #   선형 수요: 이용 잔존율 = max(0, 1 - α · 요금/성인요금)
+        alpha = st.slider(
+            "가격 민감도 α — 요금이 오르면 노인 이용이 줄어드는 정도", 0.0, 1.0, 0.5, 0.05,
+            help="α=0이면 이용량 변화 없음(명목 최대치), α=1이면 노인요금이 성인요금과 같아질 때 "
+                 "노인 이용이 0이 됩니다. 무임 혜택의 유발수요를 감안하면 보통 0.3~0.5를 보수적으로 씁니다.")
+
         sub = bl[bl["노선"].isin(lines)] if lines else bl.iloc[0:0]
         rows = []
+        tot_rides = tot_rides_after = 0.0
         for b in band_cols:
             rides = sub[b].sum() if not sub.empty else 0
-            before = rides * base_fare          # 현행(무료) → 전액이 손실
-            recovered = rides * band_fare[b]    # 부과분만큼 회복
+            fare = band_fare[b]
+            retention = max(0.0, 1 - alpha * fare / base_fare) if base_fare else 0.0
+            new_rides = rides * retention       # 요금 부과로 줄어든 개편 후 이용
+            before = rides * base_fare          # 현행(무료) → 전액이 명목 손실
+            recovered = new_rides * fare        # 실제 징수액 = 회복액(이용 감소 반영)
             rows.append({"시간대": b, "현행 손실(전)": before / 1e8,
                          "개편후 잔여손실(후)": (before - recovered) / 1e8,
                          "회복액": recovered / 1e8})
+            tot_rides += rides
+            tot_rides_after += new_rides
         sim = pd.DataFrame(rows)
         tot_before = sim["현행 손실(전)"].sum()
         tot_recovered = sim["회복액"].sum()
         tot_after = sim["개편후 잔여손실(후)"].sum()
         pct = (tot_recovered / tot_before * 100) if tot_before else 0
+        ride_drop = (1 - tot_rides_after / tot_rides) * 100 if tot_rides else 0
 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("현행 무임손실(전)", f"{tot_before:,.0f} 억원")
         m2.metric("회복액", f"{tot_recovered:,.1f} 억원")
         m3.metric("개편후 잔여손실(후)", f"{tot_after:,.0f} 억원")
         m4.metric("회복률", f"{pct:.1f}%")
+        st.caption(
+            f"가격 민감도 α={alpha:.2f} 가정 시, 요금 부과로 노인 이용은 전체적으로 약 "
+            f"**{ride_drop:.1f}% 감소**한 것으로 추정됩니다(유료 시간대일수록 더 감소). "
+            f"α를 0으로 두면 이용 변화가 없는 명목 최대치가 됩니다.")
 
         # 시간대별 전후 비교 막대그래프
         longdf = sim.melt(id_vars="시간대", value_vars=["현행 손실(전)", "개편후 잔여손실(후)"],
@@ -494,11 +522,12 @@ def main():
         st.caption("회색=현행(전), 파랑=개편 후(후). 두 막대의 차이가 해당 시간대의 회복액입니다.")
 
         st.error(
-            "**해석 주의 (중요).** 이 수치는 *행동 변화를 가정하지 않은 명목상 최대치*입니다. "
-            "실제로는 ①요금이 생기면 이용을 줄이는 노인이 많아 그만큼 걷히지 않고, "
+            "**해석 주의 (중요).** 이 시뮬레이터는 가격 민감도 α로 *요금이 생기면 이용이 줄어드는 효과*를 "
+            "반영합니다. α=0이면 행동 변화가 없는 **명목상 최대치**, α를 올릴수록 보수적인 추정이 됩니다. "
+            "다만 ①α는 측정값이 아니라 **가정**이므로 단일 숫자보다 *범위*로 보는 것이 안전하고, "
             "②이미 운행 중인 열차에 1명 더 태우는 한계비용은 0에 가까우며, "
             "③무임승차는 손실인 동시에 **노인 이동권·복지** 정책이기도 합니다. "
-            "거리 추가운임도 제외했습니다. 따라서 *'이 조건에서 이론상 줄어드는 무임액의 상한'* 으로만 보세요."
+            "거리 추가운임도 제외했습니다. 따라서 *'주어진 가정에서 줄어드는 무임액의 추정치'* 로만 해석해 주세요."
         )
         with st.expander("시뮬레이션 상세표 / 호선×시간대 원자료"):
             st.dataframe(sim.round(1), hide_index=True, use_container_width=True)
@@ -524,17 +553,54 @@ def main():
                       f"명목 무임손실 약 {tot*BASE_FARE_DEFAULT/1e8:,.0f}억원 (행동변화 미반영)]"]
             return "\n".join(p)
 
+        if "chat" not in st.session_state:
+            st.session_state["chat"] = []
+
+        SEED = ("위 데이터에 근거해 '노인 무임승차 제도 개선' 자문 초안을 작성하세요. "
+                "구성: 1)핵심 진단 2)정책 대안(시간대 차등·노선 차등·부분 요금 등 2~3가지의 장단점) "
+                "3)우선 개입 대상 4)유의점(효율성과 복지·형평성 균형).")
+
         if not key:
-            st.warning("왼쪽 사이드바에서 Gemini API 키를 입력하면 자문을 생성할 수 있습니다.")
+            st.warning("왼쪽 사이드바에서 Gemini API 키를 입력하면 자문을 생성·수정할 수 있습니다.")
         else:
-            if st.button("📝 정책 자문 생성", type="primary"):
+            cc1, cc2 = st.columns([1, 1])
+            if cc1.button("📝 자문 초안 생성", type="primary"):
+                st.session_state["chat"] = [{"role": "user", "content": SEED}]
                 with st.spinner("Gemini가 검토 중..."):
                     try:
-                        st.session_state["advice"] = generate_advice(key, build_ctx())
+                        reply = chat_advice(key, st.session_state["chat"], build_ctx())
                     except Exception as e:
-                        st.error(f"오류: {e}")
-            if st.session_state.get("advice"):
-                st.markdown("---"); st.markdown(st.session_state["advice"])
+                        reply = f"오류: {e}"
+                st.session_state["chat"].append({"role": "assistant", "content": reply})
+                st.rerun()
+            if cc2.button("🗑️ 대화 초기화"):
+                st.session_state["chat"] = []
+                st.rerun()
+
+            # 지금까지의 대화 표시(초안 요청 시드 프롬프트는 숨김)
+            for msg in st.session_state["chat"]:
+                if msg["role"] == "user" and msg["content"] == SEED:
+                    continue
+                with st.chat_message("user" if msg["role"] == "user" else "assistant"):
+                    st.markdown(msg["content"])
+
+            # 후속 요청 입력창 — 대화로 자문을 계속 수정
+            with st.form("ai_followup", clear_on_submit=True):
+                follow = st.text_area(
+                    "자문을 어떻게 바꿀까요? (대화로 계속 수정할 수 있어요)",
+                    placeholder="예: 더 짧게 / 시간대 차등안을 더 구체적으로 / 반대 논거도 추가 / 표로 정리해줘",
+                    height=80, key="ai_follow")
+                sent = st.form_submit_button("✏️ 대화로 수정 요청")
+            if sent and follow.strip():
+                st.session_state["chat"].append({"role": "user", "content": follow.strip()})
+                with st.spinner("Gemini가 수정 중..."):
+                    try:
+                        reply = chat_advice(key, st.session_state["chat"], build_ctx())
+                    except Exception as e:
+                        reply = f"오류: {e}"
+                st.session_state["chat"].append({"role": "assistant", "content": reply})
+                st.rerun()
+
         with st.expander("AI 입력 요약 보기"):
             st.code(build_ctx(), language="text")
         render_sql([
