@@ -7,6 +7,7 @@ https://2y3kjvjymqdssv2mpemfi7.streamlit.app/
 
 ➡️- 프롬프트
 https://claude.ai/share/7e884a3b-b902-4615-a577-0337da6a6c66
+https://claude.ai/share/fdae5b58-17fa-4362-ae26-2ca2dd95a1fd
 
 ✅2. 데이터 (출처: 공공데이터포털)
 
@@ -38,8 +39,7 @@ https://claude.ai/share/7e884a3b-b902-4615-a577-0337da6a6c66
 - 호선, 시간대별로 노인 부담 요금을 다르게 입력하면 손실 회복률을 막대그래프로 표시
 - 제도 개선 전과 후를 비교할 수 있도록 두 개의 막대그래프로 표시
 
-➡️4) AI 지문
-- 제미나이 API 키를 통해 정책 조언 제공
+
 
 ✅5. SQL문
 
