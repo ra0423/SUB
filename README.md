@@ -7,6 +7,7 @@ https://2y3kjvjymqdssv2mpemfi7.streamlit.app/
 
 ➡️- 프롬프트
 https://claude.ai/share/7e884a3b-b902-4615-a577-0337da6a6c66
+
 https://claude.ai/share/fdae5b58-17fa-4362-ae26-2ca2dd95a1fd
 
 ✅2. 데이터 (출처: 공공데이터포털)
